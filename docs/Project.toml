@@ -1,0 +1,3 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+TimePtycho = "bd5be052-d601-463e-b543-769d3530fb18"
