@@ -4,6 +4,7 @@ import PhysicalConstants: CODATA2018
 import Unitful: ustrip
 import LinearAlgebra: ldiv!, mul!
 import Random: randperm, rand
+import Dierckx: Spline1D
 
 const c = ustrip(CODATA2018.c_0)
 
@@ -13,7 +14,7 @@ gauss(x, σ; x0=0, power=2) = exp(-1/2 * ((x-x0)/σ)^power)
 gauss(x; x0=0, power=2, fwhm) = gauss(x, fwhm_to_σ(fwhm; power=power), x0 = x0, power=power)
 
 function mock_trace_SHG(τfwhm, λ0, τrange, ωmin, ωmax; Nτ=101, dispersion=Float64[])
-    trange = 8τfwhm
+    trange = 16τfwhm
     ω0 = 2π*c/λ0
     f0 = ω0/2π
 
@@ -51,7 +52,48 @@ function mock_trace_SHG(τfwhm, λ0, τrange, ωmin, ωmax; Nτ=101, dispersion=
     end
 
     trace = FFTW.fftshift(trace, 1)
-    return τ, v, trace, Et0
+    return τ, v, t, trace, Et0
+end
+
+function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
+    zmarg = dropdims(sum(trace; dims=2); dims=2)
+    τ = 2z/c
+    ωraw = 2π*c./λ
+    if ω0 == :moment
+        ω0raw = sum(zmarg .* ωraw)/sum(zmarg)
+    end
+    if isnothing(trange)
+        trange = 2*(maximum(τ) - minimum(τ))
+    end
+    ωmax = maximum(abs.(ωraw .- ω0raw))
+
+    δt = π/ωmax
+    samples = 2^(ceil(Int, log2(trange/δt)))
+    trange_even = δt*samples
+    δω = 2π/trange_even
+
+    Nω = collect(range(0, length=samples))
+    t = @. (Nω-samples/2)*δt # time grid, centre on 0
+    ω = @. (Nω-samples/2)*δω # freq grid relative to ω0
+
+    δω = ω[2] - ω[1]
+    Δω = length(ω)*δω
+    @assert δt ≈ 2π/Δω
+    @assert length(t) == length(ω)
+
+    trace = reverse(trace; dims=1) .* ωraw.^2
+
+    out = zeros(Float64, (samples, length(z)))
+    for ii in axes(out, 2)
+        spl = Spline1D(reverse(ωraw) .- ω0raw, trace[:, ii]; k=3, bc="zero")
+        out[:, ii] .= spl.(ω)
+    end
+
+    ωmarg = dropdims(sum(out; dims=1); dims=1)
+    if z0 == :peak
+        τ0 = τ[argmax(ωmarg)]
+    end
+    τ .- τ0, ω, t, out/maximum(abs.(out))
 end
 
 mutable struct Ptychographer{gT, iT, ftT}
@@ -62,6 +104,7 @@ mutable struct Ptychographer{gT, iT, ftT}
     ω::Vector{Float64}
     measured::Matrix{Float64}
     measA::Matrix{Float64}
+    support::BitVector
     reconstructed::Matrix{Float64}
     testpulse::Vector{ComplexF64}
     gatepulse::Vector{ComplexF64}
@@ -70,13 +113,22 @@ mutable struct Ptychographer{gT, iT, ftT}
     errors::Vector{Float64}
     buffer::Vector{ComplexF64}
     ψ::Vector{ComplexF64}
+    ψf::Vector{ComplexF64}
     ψp::Vector{ComplexF64}
+    ψfp::Vector{ComplexF64}
     φ::Vector{Float64}
     diff::Vector{ComplexF64}
 end
 
-function Ptychographer(interaction, geometry, τ, ω, trace)
-    testpulse = rand(ComplexF64, length(ω))
+function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
+    δω = ω[2] - ω[1]
+    N = length(ω)
+    Δω = N*δω
+    δt = 2π/Δω
+    idx = collect(1:N)
+    t = @. (idx - N/2)*δt
+    marg = dropdims(sum(trace; dims=1); dims=1)
+    testpulse = complex(Spline1D(τ, marg; k=3, bc="zero").(t))
     FT = FFTW.plan_fft(testpulse, 1, flags=FFTW.PATIENT)
     inv(FT) # plan inverse FFT
     s = sign.(trace)
@@ -88,27 +140,39 @@ function Ptychographer(interaction, geometry, τ, ω, trace)
     gateshift = zeros(ComplexF64, length(ω))
     buffer = copy(gateshift)
     ψ = copy(gateshift)
+    ψf = copy(gateshift)
     ψp = copy(gateshift)
+    ψfp = copy(gateshift)
     diff = copy(gateshift)
     φ = zeros(Float64, length(ω))
+    if isnothing(support)
+        support = ones(Bool, length(ω))
+    end
 
     Ptychographer(geometry, interaction, FT, τ, FFTW.fftshift(ω),
-                  trace, measA, rec, testpulse, gatepulse, gateshift,
-                  iters, errors, buffer, ψ, ψp, φ, diff)
+                  trace, FFTW.fftshift(measA, 1), FFTW.fftshift(support), rec, testpulse,
+                  gatepulse, gateshift,
+                  iters, errors, buffer, ψ, ψf, ψp, ψfp, φ, diff)
 
 end
 
-function doiter!(pt::Ptychographer; random_order=true, α=0.8)
+function doiter!(pt::Ptychographer;
+                 random_order=true, α=(0.2, 0.8), soft_thr=true, γ=1e-3)
     for ii in randperm(size(pt.measured, 2))
         pt.gatepulse .= pt.testpulse
         pt.gateshift .= pt.gatepulse
         τshift!(pt, pt.gateshift, pt.τ[ii])
         signal_field!(pt.ψ, pt.interaction, pt.testpulse, pt.gateshift)
 
-        mul!(pt.buffer, pt.FT, pt.ψ)
-        pt.φ .= angle.(pt.buffer)
-        pt.buffer .= pt.measA[:, ii] .* exp.(1im .* pt.φ)
-        ldiv!(pt.ψp, pt.FT, pt.buffer)
+        mul!(pt.ψf, pt.FT, pt.ψ)
+        for jj in eachindex(pt.ψfp)
+            if pt.support[jj] || ~soft_thr
+                pt.ψfp[jj] = pt.measA[jj, ii] .* exp.(1im .* angle(pt.ψf[jj]))
+            else
+                pt.ψfp[jj] = fγ(real(pt.ψf[jj]), γ) + 1im*fγ(imag(pt.ψf[jj]), γ)
+            end
+        end
+        ldiv!(pt.ψp, pt.FT, pt.ψfp)
 
         @. pt.diff = pt.ψp - pt.ψ
 
@@ -117,7 +181,7 @@ function doiter!(pt::Ptychographer; random_order=true, α=0.8)
         end
 
         for jj in eachindex(pt.testpulse)
-            pt.testpulse[jj] += pt.diff[jj] * α * conj(pt.gateshift[jj])/m
+            pt.testpulse[jj] += pt.diff[jj] * getα(α) * conj(pt.gateshift[jj])/m
         end
     end
     pt.iters += 1
@@ -125,13 +189,17 @@ function doiter!(pt::Ptychographer; random_order=true, α=0.8)
     update_recon!(pt)
 end
 
+getα(α::Tuple) = α[1] + (α[2]-α[1])*rand()
+getα(α::Number) = α
+
 function update_recon!(pt::Ptychographer)
     for ii in axes(pt.measured, 2)
         τshift!(pt.gateshift, pt, pt.gatepulse, pt.τ[ii])
         signal_field!(pt.ψ, pt.interaction, pt.testpulse, pt.gateshift)
         mul!(pt.buffer, pt.FT, pt.ψ)
+        FFTW.fftshift!(pt.ψf, pt.buffer, 1)
         for jj in axes(pt.measured, 1)
-            pt.reconstructed[jj, ii] = abs2(pt.buffer[jj])
+            pt.reconstructed[jj, ii] = abs2(pt.ψf[jj])
         end
     end
     ηnom = sum(eachindex(pt.measured)) do ii
@@ -166,6 +234,8 @@ end
 function τshift!(dest, pt::Ptychographer, Et, τ)
     τshift!(dest, Et, τ, pt.ω, pt.FT, pt.buffer)
 end
+
+fγ(x, γ) = x >= γ ? x - γ*sign(x) : zero(x)
 
 abstract type AbstractGeometry end
 abstract type AbstractInteraction end
