@@ -2,6 +2,7 @@ module TimePtycho
 import FFTW
 import PhysicalConstants: CODATA2018
 import Unitful: ustrip
+import Statistics: mean
 import LinearAlgebra: ldiv!, mul!
 import Random: randperm, rand
 import Dierckx: Spline1D
@@ -81,7 +82,7 @@ function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
     @assert δt ≈ 2π/Δω
     @assert length(t) == length(ω)
 
-    trace = reverse(trace; dims=1) .* ωraw.^2
+    trace = reverse(trace ./ ωraw.^2; dims=1)
 
     out = zeros(Float64, (samples, length(z)))
     for ii in axes(out, 2)
@@ -95,6 +96,15 @@ function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
     end
     τ .- τ0, ω, t, out/maximum(abs.(out))
 end
+
+function sub_dark!(λtrace, trace, λdark, dark)
+    idcs = minimum(λtrace) .<= λdark .<= maximum(λtrace)
+    dark = avg(dark)
+    trace .-= dark[idcs]
+end
+
+avg(dark::AbstractVector) = dark
+avg(dark::AbstractMatrix) = dropdims(mean(dark; dims=2); dims=2)
 
 mutable struct Ptychographer{gT, iT, ftT}
     geometry::gT
@@ -116,7 +126,6 @@ mutable struct Ptychographer{gT, iT, ftT}
     ψf::Vector{ComplexF64}
     ψp::Vector{ComplexF64}
     ψfp::Vector{ComplexF64}
-    φ::Vector{Float64}
     diff::Vector{ComplexF64}
 end
 
@@ -144,20 +153,19 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
     ψp = copy(gateshift)
     ψfp = copy(gateshift)
     diff = copy(gateshift)
-    φ = zeros(Float64, length(ω))
     if isnothing(support)
-        support = ones(Bool, length(ω))
+        support = trues(length(ω))
     end
 
     Ptychographer(geometry, interaction, FT, τ, FFTW.fftshift(ω),
                   trace, FFTW.fftshift(measA, 1), FFTW.fftshift(support), rec, testpulse,
                   gatepulse, gateshift,
-                  iters, errors, buffer, ψ, ψf, ψp, ψfp, φ, diff)
+                  iters, errors, buffer, ψ, ψf, ψp, ψfp, diff)
 
 end
 
 function doiter!(pt::Ptychographer;
-                 random_order=true, α=(0.2, 0.8), soft_thr=true, γ=1e-3)
+                 random_order=true, α=(0.6, 1.0), soft_thr=true, γ=1e-3)
     for ii in randperm(size(pt.measured, 2))
         pt.gatepulse .= pt.testpulse
         pt.gateshift .= pt.gatepulse
@@ -167,7 +175,7 @@ function doiter!(pt::Ptychographer;
         mul!(pt.ψf, pt.FT, pt.ψ)
         for jj in eachindex(pt.ψfp)
             if pt.support[jj] || ~soft_thr
-                pt.ψfp[jj] = pt.measA[jj, ii] .* exp.(1im .* angle(pt.ψf[jj]))
+                pt.ψfp[jj] = pt.ψf[jj]/abs(pt.ψf[jj]) * pt.measA[jj, ii]
             else
                 pt.ψfp[jj] = fγ(real(pt.ψf[jj]), γ) + 1im*fγ(imag(pt.ψf[jj]), γ)
             end
