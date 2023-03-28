@@ -94,13 +94,40 @@ function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
     if z0 == :peak
         τ0 = τ[argmax(ωmarg)]
     end
-    τ .- τ0, ω, t, out/maximum(abs.(out))
+    τ .- τ0, ω, ω0raw, t, out/maximum(abs.(out))
 end
 
 function sub_dark!(λtrace, trace, λdark, dark)
     idcs = minimum(λtrace) .<= λdark .<= maximum(λtrace)
     dark = avg(dark)
     trace .-= dark[idcs]
+end
+
+function marg_correct!(trace, ωtrace, ω0, λfund, fund)
+    ωfund = reverse(2π*c./λfund)
+    fundω = reverse(fund ./ ωfund.^2)
+    ω0_fund = sum(fundω .* ωfund)/sum(fundω)
+
+    Iω_fund = Spline1D(ωfund .- ω0_fund, fundω; k=3, bc="zero").(ωtrace)
+    Iω_fund_t = FFTW.ifft(FFTW.ifftshift(Iω_fund))
+    IωSHG = real(FFTW.fftshift(FFTW.fft(Iω_fund_t .^ 2)))
+    IωSHG ./= maximum(IωSHG)
+
+    marg = dropdims(sum(trace; dims=2); dims=2)
+    marg ./= maximum(marg)
+
+    for ii in eachindex(marg)
+        if marg[ii] > 0
+            trace[ii, :] .*= IωSHG[ii] / marg[ii]
+        else
+            trace[ii, :] .= 0
+        end
+    end
+end
+
+function threshold!(trace, rtol)
+    val = maximum(trace)*rtol
+    trace[trace .< val] .= 0
 end
 
 avg(dark::AbstractVector) = dark
@@ -112,6 +139,7 @@ mutable struct Ptychographer{gT, iT, ftT}
     FT::ftT
     τ::Vector{Float64}
     ω::Vector{Float64}
+    t::Vector{Float64}
     measured::Matrix{Float64}
     measA::Matrix{Float64}
     support::BitVector
@@ -157,7 +185,7 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
         support = trues(length(ω))
     end
 
-    Ptychographer(geometry, interaction, FT, τ, FFTW.fftshift(ω),
+    Ptychographer(geometry, interaction, FT, τ, FFTW.fftshift(ω), t,
                   trace, FFTW.fftshift(measA, 1), FFTW.fftshift(support), rec, testpulse,
                   gatepulse, gateshift,
                   iters, errors, buffer, ψ, ψf, ψp, ψfp, diff)
@@ -165,7 +193,7 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
 end
 
 function doiter!(pt::Ptychographer;
-                 random_order=true, α=(0.6, 1.0), soft_thr=true, γ=1e-3)
+                 α=(0.6, 1.0), soft_thr=true, γ=1e-3)
     for ii in randperm(size(pt.measured, 2))
         pt.gatepulse .= pt.testpulse
         pt.gateshift .= pt.gatepulse
@@ -188,8 +216,9 @@ function doiter!(pt::Ptychographer;
             abs2(gi)
         end
 
+        α_ = getα(α)
         for jj in eachindex(pt.testpulse)
-            pt.testpulse[jj] += pt.diff[jj] * getα(α) * conj(pt.gateshift[jj])/m
+            pt.testpulse[jj] += pt.diff[jj] * α_ * conj(pt.gateshift[jj])/m
         end
     end
     pt.iters += 1
