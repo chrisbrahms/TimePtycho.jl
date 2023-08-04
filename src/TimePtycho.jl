@@ -195,7 +195,6 @@ end
 function doiter!(pt::Ptychographer;
                  α=(0.6, 1.0), soft_thr=true, γ=1e-3)
     for ii in randperm(size(pt.measured, 2))
-        pt.gatepulse .= pt.testpulse
         pt.gateshift .= pt.gatepulse
         τshift!(pt, pt.gateshift, pt.τ[ii])
         signal_field!(pt.ψ, pt.interaction, pt.testpulse, pt.gateshift)
@@ -217,12 +216,33 @@ function doiter!(pt::Ptychographer;
         end
 
         α_ = getα(α)
+
+        if isa(pt.geometry, XFROG)
+            pt.buffer .= pt.testpulse # save old testpulse for gate update
+        end
+
         for jj in eachindex(pt.testpulse)
             pt.testpulse[jj] += pt.diff[jj] * α_ * conj(pt.gateshift[jj])/m
         end
+        
+        if isa(pt.geometry, XFROG)
+            # buffer now contains the old test pulse before the update
+            m = maximum(pt.buffer) do ti
+                abs2(ti)
+            end
+            for jj in eachindex(pt.gateshift)
+                pt.gateshift[jj] += pt.diff[jj] * α_ * conj(pt.buffer[jj])/m
+            end
+            τshift!(pt.gatepulse, pt, pt.gateshift, -pt.τ[ii])
+            if isa(pt.interaction, XPM)
+                pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
+            end
+        else
+            pt.gatepulse .= pt.testpulse
+        end
+        
     end
     pt.iters += 1
-    pt.gatepulse .= pt.testpulse
     update_recon!(pt)
 end
 
@@ -281,8 +301,9 @@ struct FROG <: AbstractGeometry end
 struct XFROG <: AbstractGeometry end
 
 struct SHG <: AbstractInteraction end
+struct XPM <: AbstractInteraction end
 
-function signal_field!(dest, int::SHG, test, gate)
+function signal_field!(dest, int, test, gate)
     dest .= test .* gate
 end
 
