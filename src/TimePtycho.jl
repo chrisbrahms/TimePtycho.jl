@@ -6,6 +6,7 @@ import Statistics: mean
 import LinearAlgebra: ldiv!, mul!
 import Random: randperm, rand
 import Dierckx: Spline1D
+import DSP: unwrap
 
 const c = ustrip(CODATA2018.c_0)
 
@@ -155,6 +156,10 @@ mutable struct Ptychographer{gT, iT, ftT}
     ψp::Vector{ComplexF64}
     ψfp::Vector{ComplexF64}
     diff::Vector{ComplexF64}
+    best_test::Vector{ComplexF64}
+    best_gate::Vector{ComplexF64}
+    best_error::Float64
+    best_iter::Int64
 end
 
 function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
@@ -188,7 +193,8 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
     Ptychographer(geometry, interaction, FT, τ, FFTW.fftshift(ω), t,
                   trace, FFTW.fftshift(measA, 1), FFTW.fftshift(support), rec, testpulse,
                   gatepulse, gateshift,
-                  iters, errors, buffer, ψ, ψf, ψp, ψfp, diff)
+                  iters, errors, buffer, ψ, ψf, ψp, ψfp, diff, copy(testpulse), copy(testpulse),
+                  Inf, 0)
 
 end
 
@@ -202,7 +208,12 @@ function doiter!(pt::Ptychographer;
         mul!(pt.ψf, pt.FT, pt.ψ)
         for jj in eachindex(pt.ψfp)
             if pt.support[jj] || ~soft_thr
-                pt.ψfp[jj] = pt.ψf[jj]/abs(pt.ψf[jj]) * pt.measA[jj, ii]
+                a = abs(pt.ψf[jj])
+                if a > 0
+                    pt.ψfp[jj] = pt.ψf[jj]/a * pt.measA[jj, ii]
+                else
+                    pt.ψfp[jj] = pt.measA[jj, ii] * exp(1im*2π*rand())
+                end
             else
                 pt.ψfp[jj] = fγ(real(pt.ψf[jj]), γ) + 1im*fγ(imag(pt.ψf[jj]), γ)
             end
@@ -211,9 +222,7 @@ function doiter!(pt::Ptychographer;
 
         @. pt.diff = pt.ψp - pt.ψ
 
-        m = maximum(pt.gateshift) do gi
-            abs2(gi)
-        end
+        m = maximum(abs2, pt.gateshift)
 
         α_ = getα(α)
 
@@ -227,15 +236,14 @@ function doiter!(pt::Ptychographer;
         
         if isa(pt.geometry, XFROG)
             # buffer now contains the old test pulse before the update
-            m = maximum(pt.buffer) do ti
-                abs2(ti)
-            end
+            m = maximum(abs2, pt.buffer)
             for jj in eachindex(pt.gateshift)
                 pt.gateshift[jj] += pt.diff[jj] * α_ * conj(pt.buffer[jj])/m
             end
             τshift!(pt.gatepulse, pt, pt.gateshift, -pt.τ[ii])
             if isa(pt.interaction, XPM)
-                pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
+                # pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
+                pt.gatepulse ./= abs.(pt.gatepulse)
             end
         else
             pt.gatepulse .= pt.testpulse
@@ -269,7 +277,26 @@ function update_recon!(pt::Ptychographer)
     e = sum(eachindex(pt.reconstructed)) do ii
         (pt.measured[ii] - η*pt.reconstructed[ii])^2
     end
-    push!(pt.errors, sqrt(1/length(pt.reconstructed) * e))
+    err = sqrt(1/length(pt.reconstructed) * e)
+    push!(pt.errors, err)
+    if err < pt.best_error
+        pt.best_error = err
+        pt.best_iter = pt.iters
+        pt.best_test .= pt.testpulse
+        pt.best_gate .= pt.gatepulse
+    end
+end
+
+function make_recon!(dest, pt::Ptychographer, testpulse, gatepulse)
+    for ii in axes(pt.measured, 2)
+        τshift!(pt.gateshift, pt, gatepulse, pt.τ[ii])
+        signal_field!(pt.ψ, pt.interaction, testpulse, pt.gateshift)
+        mul!(pt.buffer, pt.FT, pt.ψ)
+        FFTW.fftshift!(pt.ψf, pt.buffer, 1)
+        for jj in axes(pt.measured, 1)
+            dest[jj, ii] = abs2(pt.ψf[jj])
+        end
+    end
 end
 
 function τshift!(Et, τ, ω, FT, buffer)
