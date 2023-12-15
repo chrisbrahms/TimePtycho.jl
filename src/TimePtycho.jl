@@ -7,6 +7,7 @@ import LinearAlgebra: ldiv!, mul!
 import Random: randperm, rand
 import Dierckx: Spline1D
 import DSP: unwrap
+import ImageSegmentation: seeded_region_growing, labels_map
 
 const c = ustrip(CODATA2018.c_0)
 
@@ -57,7 +58,7 @@ function mock_trace_SHG(τfwhm, λ0, τrange, ωmin, ωmax; Nτ=101, dispersion=
     return τ, v, t, trace, Et0
 end
 
-function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
+function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing, τ0shift=0)
     zmarg = dropdims(sum(trace; dims=2); dims=2)
     τ = 2z/c
     ωraw = 2π*c./λ
@@ -94,8 +95,10 @@ function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing)
     ωmarg = dropdims(sum(out; dims=1); dims=1)
     if z0 == :peak
         τ0 = τ[argmax(ωmarg)]
+    elseif z0 == :moment
+        τ0 = sum(ωmarg .* τ)/sum(ωmarg)
     end
-    τ .- τ0, ω, ω0raw, t, out/maximum(abs.(out))
+    τ .- τ0 .- τ0shift, ω, ω0raw, t, out/maximum(abs.(out))
 end
 
 function sub_dark!(λtrace, trace, λdark, dark)
@@ -106,7 +109,7 @@ end
 
 function marg_correct!(trace, ωtrace, ω0, λfund, fund)
     ωfund = reverse(2π*c./λfund)
-    fundω = reverse(fund ./ ωfund.^2)
+    fundω = reverse(fund) ./ ωfund.^2
     ω0_fund = sum(fundω .* ωfund)/sum(fundω)
 
     Iω_fund = Spline1D(ωfund .- ω0_fund, fundω; k=3, bc="zero").(ωtrace)
@@ -126,9 +129,43 @@ function marg_correct!(trace, ωtrace, ω0, λfund, fund)
     end
 end
 
-function threshold!(trace, rtol)
+function marg_correct_SD!(trace, ωtrace, λfund, fund)
+    ωfund = reverse(2π*c./λfund)
+    fundω = reverse(fund) ./ ωfund.^2
+    ω0_fund = sum(fundω .* ωfund)/sum(fundω)
+
+    Iω_fund = Spline1D(ωfund .- ω0_fund, fundω; k=3, bc="zero").(ωtrace)
+    Iω_fund ./= maximum(Iω_fund)
+
+    marg = dropdims(sum(trace; dims=2); dims=2)
+    marg ./= maximum(marg)
+
+    for ii in eachindex(marg)
+        if marg[ii] > 0
+            trace[ii, :] .*= Iω_fund[ii] / marg[ii]
+        else
+            trace[ii, :] .= 0
+        end
+    end
+end
+
+function threshold!(trace, rtol; remove_islands=true)
     val = maximum(trace)*rtol
-    trace[trace .< val] .= 0
+    if remove_islands
+        trace_bin = trace .>= val
+        maxidx = argmax(trace)
+        seeds = [
+            (maxidx, 1),
+            (CartesianIndex(size(trace, 1), 1), 2),
+            (CartesianIndex(size(trace, 1), size(trace, 2)), 3),
+            (CartesianIndex(1, size(trace, 2)), 4),
+            (CartesianIndex(1, 1), 5)
+        ]
+        seg = seeded_region_growing(trace_bin, seeds)
+        trace[labels_map(seg) .≠ 1] .= 0
+    else
+        trace[trace .< val] .= 0
+    end
 end
 
 avg(dark::AbstractVector) = dark
@@ -160,6 +197,10 @@ mutable struct Ptychographer{gT, iT, ftT}
     best_gate::Vector{ComplexF64}
     best_error::Float64
     best_iter::Int64
+    test_saved::Vector{ComplexF64}
+    gate_saved::Vector{ComplexF64}
+    rec_candidate::Matrix{Float64}
+    err_candidate::Float64
 end
 
 function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
@@ -177,7 +218,7 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
     measA = @. s * sqrt(abs(trace))
     rec = zeros(Float64, size(trace))
     iters = 0
-    errors = Float64[]
+    errors = Float64[Inf]
     gatepulse = rand(ComplexF64, length(ω))
     gateshift = zeros(ComplexF64, length(ω))
     buffer = copy(gateshift)
@@ -194,12 +235,15 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
                   trace, FFTW.fftshift(measA, 1), FFTW.fftshift(support), rec, testpulse,
                   gatepulse, gateshift,
                   iters, errors, buffer, ψ, ψf, ψp, ψfp, diff, copy(testpulse), copy(testpulse),
-                  Inf, 0)
+                  Inf, 0, copy(testpulse), copy(testpulse), copy(rec), Inf)
 
 end
 
 function doiter!(pt::Ptychographer;
-                 α=(0.6, 1.0), soft_thr=true, γ=1e-3)
+                 α=(0.6, 1.0), soft_thr=false, γ=1e-3,
+                 force_improvement=false)
+    pt.gate_saved .= pt.gatepulse
+    pt.test_saved .= pt.testpulse
     for ii in randperm(size(pt.measured, 2))
         pt.gateshift .= pt.gatepulse
         τshift!(pt, pt.gateshift, pt.τ[ii])
@@ -248,11 +292,23 @@ function doiter!(pt::Ptychographer;
         else
             pt.gatepulse .= pt.testpulse
         end
-        
+    end
+    err = update_recon!(pt)
+    if force_improvement && err > pt.errors[end]
+        pt.testpulse .= pt.test_saved
+        pt.gatepulse .= pt.gate_saved
+    else
+        pt.reconstructed .= pt.rec_candidate
+        push!(pt.errors, err)
+    end
+    if err < pt.best_error
+        pt.best_error = err
+        pt.best_iter = pt.iters
+        pt.best_test .= pt.testpulse
+        pt.best_gate .= pt.gatepulse
     end
     pt.iters += 1
-    update_recon!(pt)
-end
+    end
 
 getα(α::Tuple) = α[1] + (α[2]-α[1])*rand()
 getα(α::Number) = α
@@ -264,27 +320,20 @@ function update_recon!(pt::Ptychographer)
         mul!(pt.buffer, pt.FT, pt.ψ)
         FFTW.fftshift!(pt.ψf, pt.buffer, 1)
         for jj in axes(pt.measured, 1)
-            pt.reconstructed[jj, ii] = abs2(pt.ψf[jj])
+            pt.rec_candidate[jj, ii] = abs2(pt.ψf[jj])
         end
     end
     ηnom = sum(eachindex(pt.measured)) do ii
-        pt.measured[ii] * pt.reconstructed[ii]
+        pt.measured[ii] * pt.rec_candidate[ii]
     end
-    ηden = sum(pt.reconstructed) do ri
+    ηden = sum(pt.rec_candidate) do ri
         ri^2
     end
     η = ηnom/ηden
-    e = sum(eachindex(pt.reconstructed)) do ii
-        (pt.measured[ii] - η*pt.reconstructed[ii])^2
+    e = sum(eachindex(pt.rec_candidate)) do ii
+        (pt.measured[ii] - η*pt.rec_candidate[ii])^2
     end
-    err = sqrt(1/length(pt.reconstructed) * e)
-    push!(pt.errors, err)
-    if err < pt.best_error
-        pt.best_error = err
-        pt.best_iter = pt.iters
-        pt.best_test .= pt.testpulse
-        pt.best_gate .= pt.gatepulse
-    end
+    return sqrt(1/length(pt.rec_candidate) * e)
 end
 
 function make_recon!(dest, pt::Ptychographer, testpulse, gatepulse)
