@@ -107,12 +107,11 @@ function sub_dark!(λtrace, trace, λdark, dark)
     trace .-= dark[idcs]
 end
 
-function marg_correct!(trace, ωtrace, ω0, λfund, fund)
+function marg_correct!(trace, ωtrace, ω0, λfund, fund; threshold=0)
     ωfund = reverse(2π*c./λfund)
     fundω = reverse(fund) ./ ωfund.^2
-    ω0_fund = sum(fundω .* ωfund)/sum(fundω)
 
-    Iω_fund = Spline1D(ωfund .- ω0_fund, fundω; k=3, bc="zero").(ωtrace)
+    Iω_fund = Spline1D(ωfund .- ω0/2, fundω; k=3, bc="zero").(ωtrace)
     Iω_fund_t = FFTW.ifft(FFTW.ifftshift(Iω_fund))
     IωSHG = real(FFTW.fftshift(FFTW.fft(Iω_fund_t .^ 2)))
     IωSHG ./= maximum(IωSHG)
@@ -120,8 +119,10 @@ function marg_correct!(trace, ωtrace, ω0, λfund, fund)
     marg = dropdims(sum(trace; dims=2); dims=2)
     marg ./= maximum(marg)
 
+    m = maximum(marg)
+
     for ii in eachindex(marg)
-        if marg[ii] > 0
+        if marg[ii] > threshold*m
             trace[ii, :] .*= IωSHG[ii] / marg[ii]
         else
             trace[ii, :] .= 0
@@ -219,7 +220,7 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
     rec = zeros(Float64, size(trace))
     iters = 0
     errors = Float64[Inf]
-    gatepulse = rand(ComplexF64, length(ω))
+    gatepulse = copy(testpulse)
     gateshift = zeros(ComplexF64, length(ω))
     buffer = copy(gateshift)
     ψ = copy(gateshift)
@@ -255,8 +256,8 @@ function doiter!(pt::Ptychographer;
                 a = abs(pt.ψf[jj])
                 if a > 0
                     pt.ψfp[jj] = pt.ψf[jj]/a * pt.measA[jj, ii]
-                else
-                    pt.ψfp[jj] = pt.measA[jj, ii] * exp(1im*2π*rand())
+                # else
+                    # pt.ψfp[jj] = pt.measA[jj, ii] * exp(1im*2π*rand())
                 end
             else
                 pt.ψfp[jj] = fγ(real(pt.ψf[jj]), γ) + 1im*fγ(imag(pt.ψf[jj]), γ)
