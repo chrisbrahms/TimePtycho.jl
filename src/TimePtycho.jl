@@ -58,13 +58,67 @@ function mock_trace_SHG(τfwhm, λ0, τrange, ωmin, ωmax; Nτ=101, dispersion=
     return τ, v, t, trace, Et0
 end
 
-function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing, τ0shift=0)
-    zmarg = dropdims(sum(trace; dims=2); dims=2)
-    τ = 2z/c
-    ωraw = 2π*c./λ
-    if ω0 == :moment
-        ω0raw = sum(zmarg .* ωraw)/sum(zmarg)
+function mock_trace_SFG(τfwhm_test, λtest, τfwhm_gate, λgate, τrange, ωmax; Nτ=101, dispersion=Float64[])
+    trange = 8*sqrt(τfwhm_test^2 + τfwhm_gate^2)
+    ω0 = 2π*c/λtest + 2π*c/λgate
+    f0 = ω0/2π
+
+    fmax = ωmax/2π
+    fmaxrel = fmax-f0 # maximum frequency shift
+    δt = 1/2fmaxrel # Nyquist limit
+    samples = 2^(ceil(Int, log2(trange/δt)))
+    trange_even = δt*samples
+    δω = 2π/trange_even
+
+    Nω = collect(range(0, length=samples))
+    t = @. (Nω-samples/2)*δt # time grid, centre on 0
+    v = @. (Nω-samples/2)*δω # freq grid relative to ω0
+    # v = FFTW.fftshift(v)
+    ω = v .+ ω0
+
+    φ = zeros(length(ω))
+    for (n, φi) in enumerate(dispersion)
+        φ .+= FFTW.fftshift(v).^(n+1)./factorial(n+1) * φi
     end
+
+    function gate(τ)
+        amp = sqrt.(gauss.(t; fwhm=τfwhm_gate))
+        Ef = FFTW.fft(amp)
+        Ef .*= exp.(1im .* (FFTW.fftshift(v).*τ))
+        FFTW.ifft(Ef)
+    end
+
+    amptest = sqrt.(gauss.(t; fwhm=τfwhm_test))
+    Eftest = FFTW.fft(amptest)
+    Eftest .*= exp.(1im .* φ)
+    test = FFTW.ifft(Eftest)
+
+    trace = zeros((samples, Nτ))
+    τ = collect(range(-τrange/2, τrange/2, Nτ))
+    for (ii, τi) in enumerate(τ)
+        Esig = test .* gate(τi)
+        trace[:, ii] .= abs2.(FFTW.fft(Esig))
+    end
+
+    trace = FFTW.fftshift(trace, 1)
+    return τ, v, t, trace, test, gate(0.0)
+end
+
+function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing, τ0shift=0,
+                             zunit=:m, λmin=-Inf, λmax=Inf)
+    if zunit == :m
+        τ = 2z/c
+    elseif zunit == :fs
+        τ = z*1e-15
+    end
+
+    idcs = (λ .>= λmin) .&& (λ .<= λmax)
+
+    λ = λ[idcs]
+    trace = trace[idcs, :]
+    
+    ωraw = 2π*c./λ
+    ω0raw = getω0raw(ωraw, trace, ω0)
     if isnothing(trange)
         trange = 2*(maximum(τ) - minimum(τ))
     end
@@ -99,6 +153,17 @@ function regrid(z, λ, trace; ω0=:moment, z0=:peak, trange=nothing, τ0shift=0)
         τ0 = sum(ωmarg .* τ)/sum(ωmarg)
     end
     τ .- τ0 .- τ0shift, ω, ω0raw, t, out/maximum(abs.(out))
+end
+
+getω0raw(ωraw, trace, ω0::Number) = ω0
+
+function getω0raw(ωraw, trace, ω0::Symbol)
+    if ω0 == :moment
+        zmarg = dropdims(sum(trace; dims=2); dims=2)
+        return sum(zmarg .* ωraw)/sum(zmarg)
+    else
+        error("Invalid ω0 mode $ω0")
+    end
 end
 
 function sub_dark!(λtrace, trace, λdark, dark)
@@ -242,7 +307,7 @@ end
 
 function doiter!(pt::Ptychographer;
                  α=(0.6, 1.0), soft_thr=false, γ=1e-3,
-                 force_improvement=false)
+                 force_improvement=false, update_gate=true)
     pt.gate_saved .= pt.gatepulse
     pt.test_saved .= pt.testpulse
     for ii in randperm(size(pt.measured, 2))
@@ -280,15 +345,17 @@ function doiter!(pt::Ptychographer;
         end
         
         if isa(pt.geometry, XFROG)
-            # buffer now contains the old test pulse before the update
-            m = maximum(abs2, pt.buffer)
-            for jj in eachindex(pt.gateshift)
-                pt.gateshift[jj] += pt.diff[jj] * α_ * conj(pt.buffer[jj])/m
-            end
-            τshift!(pt.gatepulse, pt, pt.gateshift, -pt.τ[ii])
-            if isa(pt.interaction, XPM)
-                # pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
-                pt.gatepulse ./= abs.(pt.gatepulse)
+            if update_gate
+                # buffer now contains the old test pulse before the update
+                m = maximum(abs2, pt.buffer)
+                for jj in eachindex(pt.gateshift)
+                    pt.gateshift[jj] += pt.diff[jj] * α_ * conj(pt.buffer[jj])/m
+                end
+                τshift!(pt.gatepulse, pt, pt.gateshift, -pt.τ[ii])
+                if isa(pt.interaction, XPM)
+                    # pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
+                    pt.gatepulse ./= abs.(pt.gatepulse)
+                end
             end
         else
             pt.gatepulse .= pt.testpulse
@@ -368,6 +435,25 @@ end
 function τshift!(dest, pt::Ptychographer, Et, τ)
     τshift!(dest, Et, τ, pt.ω, pt.FT, pt.buffer)
 end
+
+function init_from_spec!(pt::Ptychographer, λ, Iλ, ω0; which=:test)
+    ωraw = reverse(2π*c./λ)
+    Iωraw = reverse(Iλ) ./ ωraw.^2
+
+    Iω = Spline1D(ωraw .- ω0, Iωraw; k=3, bc="zero").(pt.ω)
+    Iω[Iω .< 0] .= 0
+
+    # the extra fftshift places the pulse at the centre
+    # of the time window
+    if which == :test
+        pt.testpulse = FFTW.fftshift(FFTW.ifft(sqrt.(Iω)))
+    elseif which == :gate
+        pt.gatepulse = FFTW.fftshift(FFTW.ifft(sqrt.(Iω)))
+    else
+        error("`which` must be :test or :gate")
+    end
+end
+
 
 fγ(x, γ) = x >= γ ? x - γ*sign(x) : zero(x)
 
