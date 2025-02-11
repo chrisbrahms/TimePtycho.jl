@@ -278,6 +278,7 @@ function Ptychographer(interaction, geometry, τ, ω, trace, support=nothing)
     t = @. (idx - N/2)*δt
     marg = dropdims(sum(trace; dims=1); dims=1)
     testpulse = complex(Spline1D(τ, marg; k=3, bc="zero").(t))
+    testpulse ./= sqrt(maximum(abs2.(testpulse)))
     FT = FFTW.plan_fft(testpulse, 1, flags=FFTW.PATIENT)
     inv(FT) # plan inverse FFT
     s = sign.(trace)
@@ -355,10 +356,14 @@ function doiter!(pt::Ptychographer;
                 if isa(pt.interaction, XPM)
                     # pt.gatepulse .= exp.(1im.*angle.(pt.gatepulse))
                     pt.gatepulse ./= abs.(pt.gatepulse)
+                elseif isa(pt.interaction, TG)
+                    pt.gatepulse .= abs.(pt.gatepulse)
                 end
             end
-        else
+        elseif isa(pt.interaction, SHG)
             pt.gatepulse .= pt.testpulse
+        elseif isa(pt.interaction, TG)
+            pt.gatepulse .= abs2.(pt.testpulse)
         end
     end
     err = update_recon!(pt)
@@ -436,19 +441,28 @@ function τshift!(dest, pt::Ptychographer, Et, τ)
     τshift!(dest, Et, τ, pt.ω, pt.FT, pt.buffer)
 end
 
-function init_from_spec!(pt::Ptychographer, λ, Iλ, ω0; which=:test)
+function init_from_spec!(pt::Ptychographer, λ, Iλ, ω0; which=:test, phase=nothing)
     ωraw = reverse(2π*c./λ)
     Iωraw = reverse(Iλ) ./ ωraw.^2
 
     Iω = Spline1D(ωraw .- ω0, Iωraw; k=3, bc="zero").(pt.ω)
     Iω[Iω .< 0] .= 0
 
+    Eω = complex(sqrt.(Iω))
+
+    if ~isnothing(phase)
+        Eω .*= exp.(1im*phase)
+    end
+
     # the extra fftshift places the pulse at the centre
     # of the time window
+    Et = FFTW.fftshift(FFTW.ifft(Eω))
+    Et ./= sqrt(maximum(abs2.(Et)))
+
     if which == :test
-        pt.testpulse = FFTW.fftshift(FFTW.ifft(sqrt.(Iω)))
+        pt.testpulse .= Et
     elseif which == :gate
-        pt.gatepulse = FFTW.fftshift(FFTW.ifft(sqrt.(Iω)))
+        pt.gatepulse .= Et
     else
         error("`which` must be :test or :gate")
     end
@@ -465,6 +479,7 @@ struct XFROG <: AbstractGeometry end
 
 struct SHG <: AbstractInteraction end
 struct XPM <: AbstractInteraction end
+struct TG <: AbstractInteraction end
 
 function signal_field!(dest, int, test, gate)
     dest .= test .* gate
